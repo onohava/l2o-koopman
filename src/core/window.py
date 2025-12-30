@@ -46,27 +46,59 @@ class BaseWindow:
 
         return torch.cat(list(self.win), dim=0)
 
-
 class KAEWindow(BaseWindow):
-    """
-    Window for Koopman Autoencoder (Global with Padding).
-    Automatically adapts input size to match the KAE's trained expectation.
-    """
-
-    def __init__(self, kae_model, window_m, device):
+    def __init__(self, kae_model, window_m, device, compression_dim=256):
+        """
+        compression_dim: The fixed size we want to shrink our parameters down to.
+                         The KAE will ALWAYS see vectors of this size.
+        """
         super().__init__(window_m, device)
         self.model = kae_model
-
-        if hasattr(self.model, 'input_dim'):
-            self.expected_N = self.model.input_dim
-        elif isinstance(self.model.encoder, nn.Sequential):
-            self.expected_N = self.model.encoder[0].in_features
-        elif hasattr(self.model.encoder, 'fc1'):
-            self.expected_N = self.model.encoder.fc1.in_features
-        else:
-            raise AttributeError("KAEWindow: Could not determine model input size.")
-
+        self.compression_dim = compression_dim
+        self.projection_matrix = None  # Will be created on first push
         self.psi_dim = self.model.get_latent_dim(False)
+
+        expected_input = (compression_dim + 1) * window_m
+
+        if hasattr(self.model, 'input_dim') and self.model.input_dim != expected_input:
+            print(f"WARNING: KAE expects input {self.model.input_dim}, but Window produces {expected_input}.")
+
+    def _get_projection_matrix(self, input_dim):
+        if hasattr(self.model, 'projection_cache') and self.model.projection_cache is not None:
+            self.projection_matrix = self.model.projection_cache
+            return self.projection_matrix
+
+        # Johnson–Lindenstrauss lemma
+        if self.projection_matrix is None:
+            print(f"Creating Random Projection: {input_dim} -> {self.compression_dim}")
+            P = torch.randn(input_dim, self.compression_dim, device=self.device)
+            P = P / (self.compression_dim ** 0.5)
+
+            self.projection_matrix = P.detach()
+            self.projection_matrix.requires_grad = False
+
+            if hasattr(self.model, 'projection_cache'):
+                self.model.projection_cache = self.projection_matrix
+
+        return self.projection_matrix
+
+    def push_snapshot(self, theta_flat: torch.Tensor, loss_scalar: float):
+        theta_device = theta_flat.detach().to(self.device)
+
+        D = theta_device.numel()
+        K = self.compression_dim
+
+        if D > K:
+            P = self._get_projection_matrix(D)
+            compressed_theta = torch.matmul(theta_device.unsqueeze(0), P).squeeze(0)
+        else:
+            padding = torch.zeros(K - D, device=self.device)
+            compressed_theta = torch.cat([theta_device, padding])
+
+        s_t = torch.cat([compressed_theta,
+                         torch.tensor([float(loss_scalar)], device=self.device)])
+        self.win.append(s_t)
+        return len(self.win) >= self.win.maxlen
 
     def push_and_encode(self, theta_flat: torch.Tensor, loss_scalar: float) -> torch.Tensor:
         is_ready = self.push_snapshot(theta_flat, loss_scalar)
@@ -74,29 +106,16 @@ class KAEWindow(BaseWindow):
         if not is_ready:
             return torch.zeros(self.psi_dim, device=self.device)
 
-        flat = torch.cat(list(self.win), dim=0)
-        current_N = flat.numel()
-
-        if current_N == self.expected_N:
-            x = flat
-        elif current_N < self.expected_N:
-            padding = torch.zeros(self.expected_N - current_N, device=self.device)
-            x = torch.cat([flat, padding])
-        else:
-            x = flat[:self.expected_N]
+        x = torch.cat(list(self.win), dim=0)
 
         model_device = next(self.model.parameters()).device
         if x.device != model_device:
             x = x.to(model_device)
 
         z = self.model.encoder(x)
-
         z = z.view(-1)
         psi = z[:self.psi_dim]
-
-        psi = torch.nan_to_num(psi, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return psi.to(self.device)
+        return torch.nan_to_num(psi, nan=0.0)
 
 
 class DMDWindow(BaseWindow):
@@ -104,7 +123,6 @@ class DMDWindow(BaseWindow):
     Window for Dynamic Mode Decomposition.
     Naturally handles any input size via SVD, no padding needed.
     """
-
     def __init__(self, dmd_config, window_m, device):
         super().__init__(window_m, device)
         self.rank = dmd_config.rank

@@ -83,6 +83,8 @@ class koopmanAE(nn.Module):
         self.dynamics = dynamics(b, init_scale)
         self.decoder = decoderNet(input_dim, b, ALPHA=alpha)
 
+        self.projection_cache = None
+
     def forward(self, x, mode='forward'):
         out = []
         z = self.encoder(x)

@@ -65,8 +65,9 @@ def run_experiment(dataset_name, method_name, log_dir):
     # Setup Model (L2O, KAE, or DMD)
     model = None
     if method_name == 'kae':
-        input_dim = 2 * window_size
-        print(f"Initializing KAE | Input Dim: {input_dim}")
+        COMPRESSED_DIM = 256
+        snapshot_size = COMPRESSED_DIM + 1
+        input_dim = window_size * snapshot_size
         model = koopmanAE(input_dim, 1, 8, window_size, window_size)
 
     elif method_name == 'dmd':
