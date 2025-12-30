@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from collections import deque
 
 
@@ -19,8 +20,9 @@ class BaseWindow:
         Stores the current parameter state + loss.
         Returns: True if window is full and ready for processing, False otherwise.
         """
-        # Store [theta..., loss] as a single vector per time step
-        s_t = torch.cat([theta_flat.detach(),
+        theta_device = theta_flat.detach().to(self.device)
+
+        s_t = torch.cat([theta_device,
                          torch.tensor([float(loss_scalar)], device=self.device)])
         self.win.append(s_t)
         return len(self.win) >= self.win.maxlen
@@ -35,18 +37,13 @@ class BaseWindow:
         """
         is_ready = self.push_snapshot(theta_flat, loss_scalar)
 
-        # Calculate the size of a single snapshot (params + 1 loss)
         single_snapshot_size = theta_flat.numel() + 1
 
-        # The expected full output size is M * (D + 1)
         full_window_size = self.window_m * single_snapshot_size
 
         if not is_ready:
-            # Return a zero vector of the correct full size to prevent shape mismatches
-            # in the neural network during the warm-up phase.
             return torch.zeros(full_window_size, device=self.device)
 
-        # If ready, concatenate all snapshots in the deque into one flat vector
         return torch.cat(list(self.win), dim=0)
 
 
@@ -60,7 +57,15 @@ class KAEWindow(BaseWindow):
         super().__init__(window_m, device)
         self.model = kae_model
 
-        self.expected_N = self.model.encoder.fc1.in_features
+        if hasattr(self.model, 'input_dim'):
+            self.expected_N = self.model.input_dim
+        elif isinstance(self.model.encoder, nn.Sequential):
+            self.expected_N = self.model.encoder[0].in_features
+        elif hasattr(self.model.encoder, 'fc1'):
+            self.expected_N = self.model.encoder.fc1.in_features
+        else:
+            raise AttributeError("KAEWindow: Could not determine model input size.")
+
         self.psi_dim = self.model.get_latent_dim(False)
 
     def push_and_encode(self, theta_flat: torch.Tensor, loss_scalar: float) -> torch.Tensor:
@@ -80,13 +85,18 @@ class KAEWindow(BaseWindow):
         else:
             x = flat[:self.expected_N]
 
+        model_device = next(self.model.parameters()).device
+        if x.device != model_device:
+            x = x.to(model_device)
+
         z = self.model.encoder(x)
 
         z = z.view(-1)
         psi = z[:self.psi_dim]
 
         psi = torch.nan_to_num(psi, nan=0.0, posinf=0.0, neginf=0.0)
-        return psi
+
+        return psi.to(self.device)
 
 
 class DMDWindow(BaseWindow):
@@ -108,7 +118,6 @@ class DMDWindow(BaseWindow):
 
         data = torch.stack(list(self.win), dim=1)
 
-        # DMD requires snapshots: X (t) and Y (t+1)
         X = data[:, :-1]
         Y = data[:, 1:]
 
