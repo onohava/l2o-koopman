@@ -121,7 +121,7 @@ class CIFARLoss:
              torchvision.transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
         dataset = datasets.CIFAR10(
-            './data/cifar', train=True, download=True,
+            './data', train=True, download=True,
             transform=transform
         )
         indices = list(range(len(dataset)))

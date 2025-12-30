@@ -122,7 +122,12 @@ def fit_optimizer(target_cls, target_to_opt, preproc=False, unroll=20, optim_it=
         latent_dim = koopman_model.get_latent_dim(preproc)
 
     opt_net = w(Optimizer(latent_dim, preproc=preproc))
-    meta_opt = optim.Adam(opt_net.parameters(), lr=lr)
+    all_params = list(opt_net.parameters())
+    if koopman_model is not None and isinstance(koopman_model, torch.nn.Module):
+        all_params += list(koopman_model.parameters())
+        koopman_model.train()
+
+    meta_opt = optim.Adam(all_params, lr=lr)
 
     best_net = None
     best_loss = float('inf')
