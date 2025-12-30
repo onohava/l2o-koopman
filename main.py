@@ -42,21 +42,21 @@ def run_experiment(dataset_name, method_name, log_dir):
         TargetLoss = QuadraticLoss
         Optimizee = QuadOptimizee
         lr = 0.003
-        window_size = 8
+        window_size = 64
         n_epochs = args.epochs
         optim_it = 100
     elif dataset_name == 'mnist':
         TargetLoss = MNISTLoss
         Optimizee = MNISTNet
         lr = 0.01
-        window_size = 8
+        window_size = 64
         n_epochs = args.epochs
         optim_it = 100
     elif dataset_name == 'cifar':
         TargetLoss = CIFARLoss
         Optimizee = CIFARNet
         lr = 0.01
-        window_size = 8
+        window_size = 64
         n_epochs = args.epochs
         optim_it = 100
 
