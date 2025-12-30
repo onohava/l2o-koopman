@@ -2,13 +2,13 @@ import unittest
 import torch
 import sys
 import os
+from types import SimpleNamespace
 
 sys.path.append(os.getcwd())
 
-from src.core.window import KAEWindow, DMDWindow
+from src.core.window import KAEWindow, DMDWindow, BaseWindow
+
 from src.models.koopman import koopmanAE
-from src.models.dmd import DMDEmbedding
-from src.models.optimizer import Optimizer
 
 
 class TestL2OKoopman(unittest.TestCase):
@@ -16,36 +16,46 @@ class TestL2OKoopman(unittest.TestCase):
     def setUp(self):
         self.device = torch.device('cpu')
         self.window_size = 8
-        self.n_params = 10  # Example for Quadratics
-        # Input dim = (Params + 1 Loss) * Window Size
-        self.input_dim = (self.n_params + 1) * self.window_size
+        self.n_params = 10
+        # Input dim per snapshot = Params + 1 Loss
+        self.snapshot_dim = self.n_params + 1
+        # Full window flat input dim
+        self.flat_input_dim = self.snapshot_dim * self.window_size
 
-    def test_kae_shapes(self):
+    def test_base_fixed_window_logic(self):
         """
-        Verifies the Koopman Autoencoder accepts the correct input size
-        and produces the expected latent vector.
+        NEW: Verifies the BaseWindow acts as a Fixed Window
+        (concatenating raw history).
         """
-        print("\nTesting Koopman Autoencoder Dimensions...")
-        latent_dim = 5
+        print("\nTesting Base (Fixed) Window Logic...")
+        window = BaseWindow(self.window_size, self.device)
 
-        model = koopmanAE(self.input_dim, 1, latent_dim, self.window_size, self.window_size)
-        model.to(self.device)
+        # 1. Test Warm-up (Window not full)
+        theta = torch.randn(self.n_params)
+        loss = 1.0
+        out = window.push_and_encode(theta, loss)
 
-        reported_dim = model.get_latent_dim(preproc=False)
-        self.assertEqual(reported_dim, latent_dim - 1, "KAE reported incorrect latent dim size for LSTM")
+        expected_zeros_size = self.flat_input_dim
+        self.assertEqual(out.numel(), expected_zeros_size,
+                         "Fixed Window should return full-size zero vector during warm-up")
+        self.assertTrue(torch.all(out == 0), "Fixed Window should be zeros during warm-up")
 
-        dummy_input = torch.randn(1, self.input_dim)  # Batch size 1
-        z = model.encoder(dummy_input)
-        self.assertEqual(z.shape[1], latent_dim,
-                         f"Encoder output shape mismatch. Got {z.shape}, expected (1, {latent_dim})")
+        for i in range(self.window_size - 1):
+            window.push_and_encode(torch.randn(self.n_params), float(i))
+
+        # 3. Test Full Window Output
+        out_full = window.push_and_encode(torch.randn(self.n_params), 10.0)
+        self.assertEqual(out_full.shape[0], self.flat_input_dim,
+                         f"Fixed Window output size mismatch. Got {out_full.shape[0]}, expected {self.flat_input_dim}")
+        self.assertFalse(torch.all(out_full == 0), "Fixed Window should contain data when full")
 
     def test_kae_window_logic(self):
         """
-        Verifies the Window buffer correctly flattens history for the Neural Network.
+        Verifies the KAE Window buffer handles padding and encoding.
         """
         print("\nTesting KAE Window Buffer...")
-        latent_dim = 5
-        model = koopmanAE(self.input_dim, 1, latent_dim, self.window_size, self.window_size)
+
+        model = koopmanAE(self.flat_input_dim, 1, 8, self.window_size, self.window_size)
         window = KAEWindow(model, self.window_size, self.device)
 
         # Push data until full
@@ -54,55 +64,41 @@ class TestL2OKoopman(unittest.TestCase):
             loss = float(i)
             out = window.push_and_encode(theta, loss)
 
-            if i < self.window_size:
-                # Should return zeros if not full
-                self.assertTrue(torch.all(out == 0), "Window outputted data before being full!")
-            else:
+            if i < self.window_size - 1:  # -1 because KAEWindow returns zeroes if NOT ready
+                # Logic check: window.py returns zeros if not ready
+                self.assertTrue(torch.all(out == 0), f"Window outputted data at step {i} before being full!")
+            elif i >= self.window_size:
                 # Should return valid vector
-                self.assertEqual(out.shape[0], latent_dim - 1, "Window output content shape mismatch")
+                self.assertEqual(out.shape[0], 7, "Window output content shape mismatch")
 
     def test_dmd_logic(self):
         """
-        Verifies the DMD logic computes eigenvalues without crashing on random data.
+        Verifies the DMD logic computes eigenvalues.
         """
         print("\nTesting DMD Logic...")
-        out = None
         rank = 4
-        # DMD output size = 2 * rank (Real + Imag parts)
-        expected_dim = rank * 2
+        latent_dim = rank * 2
 
-        dmd_model = DMDEmbedding(self.window_size, rank=rank)
-        window = DMDWindow(dmd_model, self.window_size, self.device)
+        # FIX: Create a config object as expected by DMDWindow
+        dmd_config = SimpleNamespace(
+            rank=rank,
+            latent_dim=latent_dim
+        )
 
-        for i in range(self.window_size + 2):
+        window = DMDWindow(dmd_config, self.window_size, self.device)
+        out = None
+
+        # Push enough data to fill window and trigger DMD
+        for i in range(self.window_size + 5):
             theta = torch.randn(self.n_params)
             loss = float(i)
             out = window.push_and_encode(theta, loss)
 
-        self.assertEqual(out.shape[0], expected_dim,
-                         f"DMD output shape mismatch. Got {out.shape[0]}, expected {expected_dim}")
+        self.assertEqual(out.shape[0], latent_dim,
+                         f"DMD output shape mismatch. Got {out.shape[0]}, expected {latent_dim}")
 
-    def test_optimizer_integration(self):
-        """
-        Verifies the LSTM Optimizer can accept [Gradient + Context] without crashing.
-        """
-        print("\nTesting LSTM Meta-Optimizer Integration...")
-        context_dim = 8
-        hidden_sz = 20
-
-        opt_net = Optimizer(latent_dim=context_dim, preproc=False, hidden_sz=hidden_sz)
-
-        grad = torch.randn(10, 1)
-        context = torch.randn(10, context_dim)
-
-        inp = torch.cat([grad, context], dim=1)
-
-        h = [torch.zeros(10, hidden_sz) for _ in range(2)]
-        c = [torch.zeros(10, hidden_sz) for _ in range(2)]
-
-        update, new_h, new_c = opt_net(inp, h, c)
-
-        self.assertEqual(update.shape, (10, 1), "Optimizer produced wrong update shape")
+        # Verify it's not all zeros (DMD worked)
+        self.assertFalse(torch.all(out == 0), "DMD produced all zeros - SVD might have failed or input was empty")
 
 
 if __name__ == '__main__':

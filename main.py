@@ -1,4 +1,6 @@
 import argparse
+import os
+
 from torch.utils.tensorboard import SummaryWriter
 
 from src.models.koopman import koopmanAE
@@ -11,6 +13,8 @@ from src.models.optimizee import (
     QuadraticLoss, QuadOptimizee,
     CIFARLoss, CIFARNet
 )
+
+from src.utils.serialization import save_checkpoint
 
 parser = argparse.ArgumentParser(description='L2O with Koopman/DMD')
 parser.add_argument('--dataset', type=str, default='quadratics', choices=['mnist', 'quadratics', 'cifar'])
@@ -45,14 +49,14 @@ def run_experiment(dataset_name, method_name, log_dir):
         TargetLoss = MNISTLoss
         Optimizee = MNISTNet
         lr = 0.01
-        window_size = 4
+        window_size = 8
         n_epochs = args.epochs
         optim_it = 100
     elif dataset_name == 'cifar':
         TargetLoss = CIFARLoss
         Optimizee = CIFARNet
         lr = 0.01
-        window_size = 4
+        window_size = 8
         n_epochs = args.epochs
         optim_it = 100
 
@@ -61,10 +65,8 @@ def run_experiment(dataset_name, method_name, log_dir):
     # Setup Model (L2O, KAE, or DMD)
     model = None
     if method_name == 'kae':
-        n_params = get_param_count(Optimizee)
-        input_dim = (n_params + 1) * window_size
+        input_dim = 2 * window_size
         print(f"Initializing KAE | Input Dim: {input_dim}")
-        # Use a small latent dim (8) for stability
         model = koopmanAE(input_dim, 1, 8, window_size, window_size)
 
     elif method_name == 'dmd':
@@ -81,6 +83,8 @@ def run_experiment(dataset_name, method_name, log_dir):
         writer=writer
     )
     writer.close()
+
+    save_checkpoint(log_dir, dataset_name, method_name, best_state, model)
 
     # Final Evaluation
     fit_data = run_evaluation(TargetLoss, Optimizee, best_state, model, optim_it)

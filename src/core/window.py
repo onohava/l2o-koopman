@@ -4,10 +4,13 @@ from collections import deque
 
 class BaseWindow:
     """
-    Base class that handles the storage of optimization history.
+    Base class that acts as a Fixed Window (Sliding Window).
+    It stores optimization history and returns the flattened raw trajectory
+    concatenated into a single vector.
     """
+
     def __init__(self, window_m, device):
-        self.win = deque(maxlen=window_m + 1)
+        self.win = deque(maxlen=window_m)  # Strict window size
         self.device = device
         self.window_m = window_m
 
@@ -16,6 +19,7 @@ class BaseWindow:
         Stores the current parameter state + loss.
         Returns: True if window is full and ready for processing, False otherwise.
         """
+        # Store [theta..., loss] as a single vector per time step
         s_t = torch.cat([theta_flat.detach(),
                          torch.tensor([float(loss_scalar)], device=self.device)])
         self.win.append(s_t)
@@ -24,18 +28,39 @@ class BaseWindow:
     def reset(self):
         self.win.clear()
 
+    def push_and_encode(self, theta_flat: torch.Tensor, loss_scalar: float) -> torch.Tensor:
+        """
+        Default Fixed Window behavior:
+        Returns the raw flattened history of the window.
+        """
+        is_ready = self.push_snapshot(theta_flat, loss_scalar)
+
+        # Calculate the size of a single snapshot (params + 1 loss)
+        single_snapshot_size = theta_flat.numel() + 1
+
+        # The expected full output size is M * (D + 1)
+        full_window_size = self.window_m * single_snapshot_size
+
+        if not is_ready:
+            # Return a zero vector of the correct full size to prevent shape mismatches
+            # in the neural network during the warm-up phase.
+            return torch.zeros(full_window_size, device=self.device)
+
+        # If ready, concatenate all snapshots in the deque into one flat vector
+        return torch.cat(list(self.win), dim=0)
+
 
 class KAEWindow(BaseWindow):
     """
-    Window for Koopman Autoencoder.
-    Flattens the history into a single vector for the Encoder.
+    Window for Koopman Autoencoder (Global with Padding).
+    Automatically adapts input size to match the KAE's trained expectation.
     """
 
     def __init__(self, kae_model, window_m, device):
         super().__init__(window_m, device)
         self.model = kae_model
-        # N = The input size the encoder expects (dynamically calculated in main.py)
-        self.N = self.model.encoder.N
+
+        self.expected_N = self.model.encoder.fc1.in_features
         self.psi_dim = self.model.get_latent_dim(False)
 
     def push_and_encode(self, theta_flat: torch.Tensor, loss_scalar: float) -> torch.Tensor:
@@ -44,17 +69,19 @@ class KAEWindow(BaseWindow):
         if not is_ready:
             return torch.zeros(self.psi_dim, device=self.device)
 
-        # Flatten the entire deque into one long vector [param_t0, loss_t0, param_t1, loss_t1...]
         flat = torch.cat(list(self.win), dim=0)
+        current_N = flat.numel()
 
-        # Pad or truncate to match Encoder input size N
-        if flat.numel() < self.N:
-            x = torch.zeros(self.N, device=self.device, dtype=flat.dtype)
-            x[:flat.numel()] = flat
+        if current_N == self.expected_N:
+            x = flat
+        elif current_N < self.expected_N:
+            padding = torch.zeros(self.expected_N - current_N, device=self.device)
+            x = torch.cat([flat, padding])
         else:
-            x = flat[:self.N]
+            x = flat[:self.expected_N]
 
         z = self.model.encoder(x)
+
         z = z.view(-1)
         psi = z[:self.psi_dim]
 
@@ -65,8 +92,9 @@ class KAEWindow(BaseWindow):
 class DMDWindow(BaseWindow):
     """
     Window for Dynamic Mode Decomposition.
-    Maintains Matrix structure for SVD.
+    Naturally handles any input size via SVD, no padding needed.
     """
+
     def __init__(self, dmd_config, window_m, device):
         super().__init__(window_m, device)
         self.rank = dmd_config.rank
@@ -78,8 +106,9 @@ class DMDWindow(BaseWindow):
         if not is_ready:
             return torch.zeros(self.latent_dim, device=self.device)
 
-        # Stack into Matrix X (Features x Time)
         data = torch.stack(list(self.win), dim=1)
+
+        # DMD requires snapshots: X (t) and Y (t+1)
         X = data[:, :-1]
         Y = data[:, 1:]
 
@@ -93,8 +122,6 @@ class DMDWindow(BaseWindow):
             S_r_inv = torch.diag(1.0 / (S[:r] + 1e-9))
             V_r = Vh[:r, :].T
 
-            # Compute Koopman Matrix Approximation
-            # A_tilde = U^T * Y * V * S^-1
             A_tilde = U_r.T @ Y @ V_r @ S_r_inv
 
             eigs = torch.linalg.eigvals(A_tilde)
@@ -107,7 +134,11 @@ class DMDWindow(BaseWindow):
             n_eigs = min(len(eigs), self.rank)
 
             out[:n_eigs] = eigs[:n_eigs].real
-            out[self.rank: self.rank + n_eigs] = eigs[:n_eigs].imag
+
+            imag_start = self.rank
+            imag_end = self.rank + n_eigs
+            if imag_end <= self.latent_dim:
+                out[imag_start: imag_end] = eigs[:n_eigs].imag
 
             return out
 
